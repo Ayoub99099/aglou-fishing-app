@@ -7,11 +7,11 @@ async function getForecastData() {
   try {
     const [weatherRes, marineRes] = await Promise.all([
       fetch(
-        `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}&hourly=temperature_2m,surface_pressure,cloud_cover,wind_speed_10m,wind_gusts_10m,is_day&timezone=Africa%2FCasablanca`,
+        `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}&hourly=temperature_2m,surface_pressure,cloud_cover,wind_speed_10m,wind_gusts_10m,is_day&past_days=1&forecast_days=3&timezone=Africa%2FCasablanca`,
         { next: { revalidate: 1800 } }
       ),
       fetch(
-        `https://marine-api.open-meteo.com/v1/marine?latitude=${LAT}&longitude=${LON}&hourly=wave_height,wave_period&timezone=Africa%2FCasablanca`,
+        `https://marine-api.open-meteo.com/v1/marine?latitude=${LAT}&longitude=${LON}&hourly=wave_height,wave_period&past_days=1&forecast_days=3&timezone=Africa%2FCasablanca`,
         { next: { revalidate: 1800 } }
       ),
     ]);
@@ -25,13 +25,15 @@ async function getForecastData() {
 
     const times: string[] = weatherData?.hourly?.time || [];
     const now = new Date();
+    
+    // Find index for current hour
     const currentIndex = times.findIndex((t) => new Date(t) >= now);
-    const startIndex = currentIndex > 0 ? currentIndex : 0;
+    const startIndex = currentIndex > 0 ? currentIndex : 24; // skip past_days if needed
 
     const forecast = [];
 
-    // Show 24-48 hours ahead in 2-hour intervals
-    for (let i = startIndex; i < Math.min(startIndex + 24, times.length); i += 2) {
+    // Step = 1 for 1-hour intervals (shows next 36 consecutive hours)
+    for (let i = startIndex; i < Math.min(startIndex + 36, times.length); i += 1) {
       const timeStr = times[i];
       const time = new Date(timeStr);
 
@@ -42,56 +44,70 @@ async function getForecastData() {
       const pressure = Math.round(weatherData?.hourly?.surface_pressure?.[i] ?? 1013);
       const isDay = weatherData?.hourly?.is_day?.[i] === 1;
       const cloudCover = weatherData?.hourly?.cloud_cover?.[i] ?? 0;
-      const waterTemp = Math.round(weatherData?.hourly?.temperature_2m?.[i] ?? 19);
+      const waterTemp = Math.round(weatherData?.hourly?.temperature_2m?.[i] ?? 20);
 
-      // --- Blueprint Scoring Algorithm ---
-      // 1. Wave Factor
+      // --- 1. WAVE FACTOR (Max +3) ---
       let waveScore = 0;
       if (waveHeight >= 0.8 && waveHeight <= 1.4) waveScore = 3;
-      else if ((waveHeight >= 0.6 && waveHeight < 0.8) || (waveHeight > 1.4 && waveHeight <= 1.7)) waveScore = 1;
+      else if ((waveHeight >= 0.6 && waveHeight <= 0.7) || (waveHeight >= 1.5 && waveHeight <= 1.7)) waveScore = 1;
       else if (waveHeight >= 1.8 && waveHeight <= 1.9) waveScore = 0;
-      else waveScore = -3;
+      else waveScore = -3; // < 0.5m OR >= 2.0m
 
-      // 2. Wind Gust Factor
+      // --- 2. WIND GUST FACTOR (Max +2) ---
       let windScore = 0;
       if (windGust < 15) windScore = 2;
       else if (windGust <= 22) windScore = 0;
-      else windScore = -3;
+      else windScore = -3; // > 22 km/h
 
-      // 3. Simulated Tide Indicator
+      // --- 3. TIDE FACTOR (Max +3) ---
       const hour = time.getHours();
-      // Tidal cycle approximation (~12.4 hr cycle)
-      const tideCycle = (hour % 12);
+      const tideCycle = hour % 12;
       let tideIcon = '⬆️';
       let tideScore = 1;
 
-      if (tideCycle >= 5 && tideCycle <= 6) {
+      if (tideCycle === 6) {
         tideIcon = 'H';
-        tideScore = 1;
-      } else if (tideCycle >= 11 || tideCycle === 0) {
+        tideScore = 1; // High Tide Peak
+      } else if (tideCycle === 0) {
         tideIcon = 'L';
-        tideScore = -2;
-      } else if (tideCycle >= 2 && tideCycle < 5) {
+        tideScore = -2; // Low Tide Dead
+      } else if (tideCycle >= 3 && tideCycle < 6) {
         tideIcon = '⬆️';
-        tideScore = 3; // Golden 3-hour feeding window before high tide
+        tideScore = 3; // Golden 3 hours before High Tide
       } else {
         tideIcon = '⬇️';
-        tideScore = -2;
+        tideScore = -2; // Falling tide
       }
 
-      // 4. Barometric Pressure Factor
+      // --- 4. BAROMETRIC PRESSURE (Max +2) ---
+      // Check 6-hour drop if previous data exists
+      const pressure6hAgo = i >= 6 ? (weatherData?.hourly?.surface_pressure?.[i - 6] ?? pressure) : pressure;
+      const pressureDrop = pressure6hAgo - pressure;
+      
       let pressureScore = 0;
-      if (pressure >= 1012 && pressure <= 1020) pressureScore = 1;
-      else if (pressure < 1005) pressureScore = -1;
+      if (pressureDrop >= 3) pressureScore = 2; // Pre-storm feeding frenzy
+      else if (pressure >= 1012 && pressure <= 1020) pressureScore = 1; // Stable
+      else if (pressure < 1005) pressureScore = -1; // Low / sluggish
 
-      // 5. Stealth Factor
+      // --- 5. STEALTH FACTOR (Max +2) ---
       let stealthScore = 0;
-      if (!isDay || cloudCover > 80) stealthScore = 2;
-      else stealthScore = -1;
+      if (!isDay || cloudCover > 80) stealthScore = 2; // Moon/Night or Overcast
+      else stealthScore = -1; // Clear Midday Sun
 
-      const totalScore = Math.max(0, Math.min(12, waveScore + windScore + tideScore + pressureScore + stealthScore + 5));
+      // --- 6. BONUS RULE: UPWELLING PENALTY ---
+      let upwellingPenalty = 0;
+      if (i >= 24) {
+        const temp24hAgo = weatherData?.hourly?.temperature_2m?.[i - 24] ?? waterTemp;
+        if (temp24hAgo - waterTemp > 2) {
+          upwellingPenalty = -3; // Sudden thermal shock
+        }
+      }
 
-      // Color mapping
+      // Calculate Total Score (0 to 12)
+      let rawScore = waveScore + windScore + tideScore + pressureScore + stealthScore + upwellingPenalty;
+      const totalScore = Math.max(0, Math.min(12, rawScore));
+
+      // --- Color Bar Mapping ---
       let colorClass = 'border-l-red-600 bg-red-500/5';
       let scoreLabel = 'Terrible';
       if (totalScore >= 10) {
@@ -105,7 +121,7 @@ async function getForecastData() {
         scoreLabel = 'Tough';
       }
 
-      const weatherIcon = !isDay ? '🌙' : cloudCover > 50 ? '☁️' : '☀️';
+      const weatherIcon = !isDay ? '🌙' : cloudCover > 60 ? '☁️' : '☀️';
 
       forecast.push({
         time: time.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
@@ -141,7 +157,7 @@ export default async function Home() {
         <div className="bg-red-700 text-white p-4 flex justify-between items-center">
           <div>
             <h1 className="text-xl font-black tracking-wide uppercase">Aglou Beach</h1>
-            <p className="text-xs text-red-100">Atlantic Rock Fishing Intelligence</p>
+            <p className="text-xs text-red-100">Atlantic Rock Fishing Intelligence (Hourly Forecast)</p>
           </div>
           <span className="text-xs font-bold bg-white text-red-700 px-3 py-1.5 rounded-full shadow">
             Score Engine
@@ -155,7 +171,7 @@ export default async function Home() {
         )}
 
         {/* 5 Columns Header */}
-        <div className="grid grid-cols-5 text-center text-xs font-bold text-slate-500 uppercase tracking-wider py-3 border-b bg-slate-50">
+        <div className="grid grid-cols-5 text-center text-xs font-bold text-slate-500 uppercase tracking-wider py-3 border-b bg-slate-50 sticky top-0 backdrop-blur z-10">
           <div>Time</div>
           <div>Wind (km/h)</div>
           <div>Sky</div>
@@ -168,7 +184,7 @@ export default async function Home() {
           {forecast.map((row, idx) => (
             <div
               key={idx}
-              className={`grid grid-cols-5 text-center items-center py-3.5 border-l-8 ${row.colorClass} transition-colors hover:bg-slate-50`}
+              className={`grid grid-cols-5 text-center items-center py-2.5 border-l-[10px] ${row.colorClass} transition-colors hover:bg-slate-50`}
             >
               {/* Col 1: Time & Date */}
               <div className="flex flex-col items-center">
@@ -181,23 +197,23 @@ export default async function Home() {
               {/* Col 2: Wind */}
               <div className="flex flex-col items-center">
                 <span className="font-bold text-sm text-slate-900">{row.windSpeed} km/h</span>
-                <span className="text-xs text-slate-500">max {row.windGust}</span>
+                <span className="text-[11px] text-slate-500">max {row.windGust}</span>
               </div>
 
-              {/* Col 3: Weather Stealth */}
-              <div className="text-2xl">{row.weatherIcon}</div>
+              {/* Col 3: Sky Stealth */}
+              <div className="text-xl">{row.weatherIcon}</div>
 
               {/* Col 4: Environment */}
               <div className="flex flex-col items-center">
                 <span className="font-bold text-sm text-orange-600">{row.waterTemp}°C</span>
-                <span className="text-xs text-slate-500">{row.pressure} hPa</span>
+                <span className="text-[11px] text-slate-500">{row.pressure} hPa</span>
               </div>
 
               {/* Col 5: Waves & Tide */}
               <div className="flex flex-col items-center">
                 <span className="font-bold text-sm text-slate-900">🌊 {row.waveHeight}m</span>
-                <span className="text-xs text-slate-500">{row.wavePeriod}s</span>
-                <span className="text-base font-bold mt-0.5" title="Tide Indicator">
+                <span className="text-[11px] text-slate-500">{row.wavePeriod}s</span>
+                <span className="text-sm font-black mt-0.5" title="Tide">
                   {row.tideIcon}
                 </span>
               </div>
@@ -205,7 +221,7 @@ export default async function Home() {
           ))}
         </div>
 
-        {/* Legend */}
+        {/* Legend Footer */}
         <div className="p-3 text-[11px] text-center text-slate-500 bg-slate-50 border-t border-slate-200">
           Score Legend: 🟢 10-12 (Epic) | 🟡 7-9 (Good) | ⚪ 4-6 (Tough) | 🔴 &lt;4 (Terrible)
         </div>
